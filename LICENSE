@@ -3,11 +3,6 @@ MIT License
 Copyright (c) 2026 Bowen Jing and Mihir Bafna
 Copyright (c) 2026 Escalante Bio
 
-jpromera is a JAX/Equinox translation of Promera
-(https://github.com/bjing2016/promera); portions are derived from Promera, which
-is distributed under the MIT License. The first copyright line above is the
-upstream Promera notice; the second covers the translation and modifications.
-
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
