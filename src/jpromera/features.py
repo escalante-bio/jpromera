@@ -102,7 +102,33 @@ def build_msas(chains, cache=None, host_url="https://api.colabfold.com", verbose
     return missing
 
 
-def featurize(schema, name="x", seed_idx=0, msa_depth=None, build_msa=True):
+def ensure_tinyprot_data(verbose=True):
+    """Make sure tinyprot's CCD + taxonomy LMDBs are present, downloading any
+    that are missing — the programmatic equivalent of ``python -m tinyprot.init
+    --download`` (prebuilt DBs from HuggingFace).
+
+    Featurization needs the CCD (``Structure.from_schema`` reference conformers)
+    and the taxonomy DB (cross-chain MSA pairing); without them tinyprot raises
+    on the first ``featurize``. Only the missing database(s) are fetched. Returns
+    the list of database names downloaded.
+    """
+    import os
+    from tinyprot.init import (_ccd_path, _tax_path, _download_file,
+                               _HF_CCD_URL, _HF_TAX_URL)
+
+    targets = [(_ccd_path, _HF_CCD_URL, "CCD"), (_tax_path, _HF_TAX_URL, "taxonomy")]
+    missing = [(p, u, d) for (p, u, d) in targets
+               if not os.path.exists(os.path.join(p, "data.mdb"))]
+    for path, url, label in missing:
+        if verbose:
+            print(f"[jpromera] tinyprot {label} DB not found at {path}; "
+                  f"downloading prebuilt LMDB from HuggingFace ...")
+        _download_file(url, os.path.join(path, "data.mdb"), f"Downloading {label}")
+    return [d for _, _, d in missing]
+
+
+def featurize(schema, name="x", seed_idx=0, msa_depth=None, build_msa=True,
+              init_data=True):
     """Featurize a tinyprot schema dict -> (Feats, struct).
 
     Returns a typed ``Feats`` (jnp arrays, the inference feature set) and the
@@ -111,6 +137,8 @@ def featurize(schema, name="x", seed_idx=0, msa_depth=None, build_msa=True):
     ``build_msa=True`` (default) constructs + caches a real MSA for any chain
     missing one (ColabFold server) rather than silently using a depth-1 dummy;
     set ``build_msa=False`` to keep the old lookup-or-dummy behaviour offline.
+    ``init_data=True`` (default) downloads tinyprot's CCD + taxonomy databases
+    if absent (``python -m tinyprot.init --download``); set False to skip.
     """
     from tinyprot.structure import Structure
     from tinyprot.feature import AF3Featurizer
@@ -118,6 +146,8 @@ def featurize(schema, name="x", seed_idx=0, msa_depth=None, build_msa=True):
 
     from .feats import Feats
 
+    if init_data:
+        ensure_tinyprot_data()
     struct = Structure.from_schema(schema)
     if build_msa:
         build_msas(struct.chains)
