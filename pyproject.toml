@@ -1,0 +1,40 @@
+[project]
+name = "jpromera"
+version = "0.1.0"
+description = "JAX/Equinox translation of Promera (standalone, with PyTorch conversion)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "Escalante Bio" }]
+dependencies = [
+    # Featurization: schema -> structure -> feats, MSA build, mmCIF output.
+    # Torch-free (numpy/rdkit/lmdb) and the only non-PyPI core dependency.
+    # Featurizing from a schema needs a one-time data init (CCD + taxonomy):
+    #   python -m tinyprot.init --download
+    "tinyprot @ git+https://github.com/bjing2016/tinyprot.git",
+    # JAX inference stack
+    "equinox>=0.11",
+    "jaxtyping>=0.2.36",
+    "einops>=0.8.0",
+    "jax>=0.10.0",
+    "jaxlib>=0.10.0",
+    "jax-cuda12-plugin>=0.10.0",
+    "jax-cuda12-pjrt>=0.10.0",
+    "gemmi>=0.6",
+    "huggingface-hub",
+]
+
+[project.optional-dependencies]
+# One-time PyTorch -> JAX weight conversion (jpromera.convert / load_model).
+# Pulls the PyTorch source model (torch, cuequivariance, rdkit, ...). NOT needed
+# to run a serialized JAX model or to featurize — only to convert checkpoints.
+convert = [
+    "promera @ git+https://github.com/bjing2016/promera.git",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

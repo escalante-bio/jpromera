@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Environment / lockfile (resolve locally; promera is an optional git dep)
+.venv/
+uv.lock
+
+# JAX persistent compile cache
+/jax_cache/
+
+# --- Dev-only, not part of the released core ---------------------------------
+# Validation harness + captured PyTorch ground truth
+/tests/
+# One-off experiment / comparison scripts
+/design_jax.py
+/fold_compare.py
+/fold_9hkq.py
+/epitope_9hkq.py
+/crop_distogram_9hkq.py
+# Weight-conversion staging + run outputs
+/hf_upload/
+/predictions_9hkq/
+/design_out/
+*.cif
