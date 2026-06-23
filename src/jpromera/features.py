@@ -127,12 +127,13 @@ def ensure_tinyprot_data(verbose=True):
     return [d for _, _, d in missing]
 
 
-def featurize(schema, name="x", seed_idx=0, msa_depth=None, build_msa=True,
-              init_data=True):
+def featurize(schema, name="x", seed_idx=0, build_msa=True, init_data=True):
     """Featurize a tinyprot schema dict -> (Feats, struct).
 
     Returns a typed ``Feats`` (jnp arrays, the inference feature set) and the
-    tinyprot Structure (for writing the predicted coords back out).
+    tinyprot Structure (for writing the predicted coords back out). The full
+    MSA is returned at its natural depth — the trunk subsamples it per recycle
+    (see ``JPromera.trunk``), so there's no need to crop it here.
 
     ``build_msa=True`` (default) constructs + caches a real MSA for any chain
     missing one (ColabFold server) rather than silently using a depth-1 dummy;
@@ -156,9 +157,6 @@ def featurize(schema, name="x", seed_idx=0, msa_depth=None, build_msa=True,
     feats = AF3Featurizer(struct, msas, pairing).featurize(compute_frames=True)
     feats = _finalize(feats, name, seed_idx)
     batch = _collate_one(feats)
-    if msa_depth is not None:
-        for k in ("msa", "msa_mask", "msa_paired", "deletion_value", "has_deletion"):
-            batch[k] = batch[k][:, :msa_depth]
     return Feats.from_dict(batch), struct
 
 

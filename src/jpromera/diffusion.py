@@ -9,9 +9,8 @@ PyTorch model_cache path used during sampling.
 from __future__ import annotations
 import einops
 import equinox as eqx
-import jax
 from jax import numpy as jnp
-from jaxtyping import Array, Float
+from jaxtyping import Array
 
 
 from .backend import (
@@ -22,12 +21,31 @@ from .backend import (
     from_torch,
     register_from_torch,
 )
-from .layers import FourierEmbedding, Transition
+from .layers import FourierEmbedding
 from .trunk import (
     AtomAttentionDecoder,
     AtomAttentionEncoder,
     DiffusionTransformer,
 )
+
+
+class DiffusionCache(eqx.Module):
+    """Coordinate-independent conditioning computed once per diffusion rollout.
+
+    Mirrors the upstream ``model_cache``: everything derived from the trunk
+    outputs and ref features (not from the noised coordinates ``r`` or noise
+    level ``sigma``) is hoisted out of the sampling loop. ``None`` fields cover
+    the depth-0 / non-structure-prediction cases.
+    """
+
+    z: Array
+    q0: Array
+    c: Array
+    p: Array | None
+    to_keys: object
+    enc_atom_biases: Array | None
+    tok_biases: Array | None
+    dec_atom_biases: Array | None
 
 
 @register_from_torch("promera.model.encoders.SingleConditioning")
@@ -79,6 +97,29 @@ class DiffusionModule(AbstractFromTorch):
     a_norm: LayerNorm
     atom_attention_decoder: AtomAttentionDecoder
 
+    def precompute_conditioning(
+        self, s_trunk, z_trunk, relative_position_encoding, feats
+    ) -> DiffusionCache:
+        """Build the coordinate-independent ``DiffusionCache`` once per rollout.
+
+        Runs the pairwise conditioner, the atom-encoder prefix, and every
+        token-/atom-transformer layer's pair bias — all loop-invariant across
+        the diffusion steps (``jax.lax.scan`` won't hoist them otherwise).
+        """
+        z = self.pairwise_conditioner(
+            z_trunk=z_trunk, token_rel_pos_feats=relative_position_encoding
+        )
+        q0, c, p, to_keys, enc_atom_biases = self.atom_attention_encoder.precompute(
+            feats=feats, s_trunk=s_trunk, z=z
+        )
+        tok_biases = self.token_transformer.precompute_biases(z)
+        dec_atom_biases = self.atom_attention_decoder.precompute_biases(p)
+        return DiffusionCache(
+            z=z, q0=q0, c=c, p=p, to_keys=to_keys,
+            enc_atom_biases=enc_atom_biases, tok_biases=tok_biases,
+            dec_atom_biases=dec_atom_biases,
+        )
+
     def __call__(
         self,
         s_inputs,
@@ -90,29 +131,47 @@ class DiffusionModule(AbstractFromTorch):
         feats,
         multiplicity=1,
         model_cache=None,
+        cache: DiffusionCache | None = None,
     ):
         assert multiplicity == 1, "JAX score model handles one sample at a time"
         s, normed_fourier = self.single_conditioner(
             times=times, s_trunk=s_trunk, s_inputs=s_inputs
         )
-        z = self.pairwise_conditioner(
-            z_trunk=z_trunk, token_rel_pos_feats=relative_position_encoding
-        )
 
-        a, q_skip, c_skip, p_skip, to_keys = self.atom_attention_encoder(
-            feats=feats, s_trunk=s_trunk, z=z, r=r_noisy, multiplicity=multiplicity
-        )
+        if cache is None:
+            # Cache-free path: recompute everything (numerically identical).
+            z = self.pairwise_conditioner(
+                z_trunk=z_trunk, token_rel_pos_feats=relative_position_encoding
+            )
+            a, q_skip, c_skip, p_skip, to_keys = self.atom_attention_encoder(
+                feats=feats, s_trunk=s_trunk, z=z, r=r_noisy,
+                multiplicity=multiplicity,
+            )
+            tok_biases = None
+            dec_atom_biases = None
+        else:
+            z = cache.z
+            a, q_skip, c_skip, p_skip, to_keys = (
+                self.atom_attention_encoder.apply_coords(
+                    cache.q0, cache.c, cache.p, cache.to_keys,
+                    cache.enc_atom_biases, r_noisy, feats, multiplicity,
+                )
+            )
+            tok_biases = cache.tok_biases
+            dec_atom_biases = cache.dec_atom_biases
+
         a = a + self.s_to_a_linear(s)
 
         mask = feats.token_pad_mask
         a = self.token_transformer(
-            a, s=s, z=z, mask=mask.astype(jnp.float32), multiplicity=multiplicity
+            a, s=s, z=z, mask=mask.astype(jnp.float32), multiplicity=multiplicity,
+            biases=tok_biases,
         )
         a = self.a_norm(a)
 
         r_update = self.atom_attention_decoder(
             a=a, q=q_skip, c=c_skip, p=p_skip, feats=feats,
-            multiplicity=multiplicity, to_keys=to_keys,
+            multiplicity=multiplicity, to_keys=to_keys, atom_biases=dec_atom_biases,
         )
         return {"r_update": r_update, "token_a": a}
 
@@ -124,7 +183,7 @@ class AtomDiffusion(eqx.Module):
     has_alt_update: bool
 
     @staticmethod
-    def from_torch(m: _diffusion.AtomDiffusion):
+    def from_torch(m):
         return AtomDiffusion(
             score_model=from_torch(m.score_model),
             sigma_data=float(m.cfg.diffusion.sigma_data),

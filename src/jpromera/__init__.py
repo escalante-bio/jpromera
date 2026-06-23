@@ -7,7 +7,6 @@ model and run inference. Converting PyTorch weights additionally requires
 below import it lazily.
 """
 
-from . import cache  # noqa: F401  (enables JAX persistent compile cache)
 from .backend import (  # noqa: F401
     AbstractFromTorch,
     Embedding,

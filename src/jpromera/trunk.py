@@ -109,10 +109,10 @@ class DiffusionTransformerLayer(AbstractFromTorch):
     output_projection: Sequential
     transition: ConditionedTransitionBlock
 
-    def __call__(self, a, s, z, mask=None, to_keys=None, multiplicity=1):
+    def __call__(self, a, s, z, mask=None, to_keys=None, multiplicity=1, bias=None):
         b = self.adaln(a, s)
         b = self.pair_bias_attn(
-            s=b, z=z, mask=mask, multiplicity=multiplicity, to_keys=to_keys
+            s=b, z=z, mask=mask, multiplicity=multiplicity, to_keys=to_keys, bias=bias
         )
         b = self.output_projection(s) * b
         a = a + b
@@ -138,17 +138,33 @@ class DiffusionTransformer(eqx.Module):
         )
         return DiffusionTransformer(stacked, static, len(layers))
 
-    def __call__(self, a, s, z, mask=None, to_keys=None, multiplicity=1):
+    def precompute_biases(self, z):
+        """Per-layer pair bias ``proj_z(z)`` for every stacked layer.
+
+        ``z`` is constant across a diffusion rollout, so the sampler computes
+        these once. Returns a ``[depth, ...]`` array (None if depth == 0).
+        """
+        if self.depth == 0:
+            return None
+
+        def one(params):
+            layer = eqx.combine(self.static, params)
+            return layer.pair_bias_attn.proj_z(z)
+
+        return jax.vmap(one)(self.stacked_parameters)
+
+    def __call__(self, a, s, z, mask=None, to_keys=None, multiplicity=1, biases=None):
         if self.depth == 0:
             return a
 
         @jax.checkpoint
-        def body_fn(a, params):
+        def body_fn(a, layer_inputs):
+            params, bias = layer_inputs
             layer = eqx.combine(self.static, params)
             return layer(a, s, z, mask=mask, to_keys=to_keys,
-                         multiplicity=multiplicity), None
+                         multiplicity=multiplicity, bias=bias), None
 
-        return jax.lax.scan(body_fn, a, self.stacked_parameters)[0]
+        return jax.lax.scan(body_fn, a, (self.stacked_parameters, biases))[0]
 
 
 @register_from_torch("promera.model.transformers.AtomTransformer")
@@ -157,7 +173,20 @@ class AtomTransformer(AbstractFromTorch):
     attn_window_keys: int
     diffusion_transformer: DiffusionTransformer
 
-    def __call__(self, q, c, p, to_keys=None, mask=None, multiplicity=1):
+    def _window_p(self, p):
+        """Reshape the atom-pair rep ``p`` into the windowed form the inner
+        transformer consumes (mirrors the ``p`` reshape in ``__call__``)."""
+        W, H = self.attn_window_queries, self.attn_window_keys
+        if W is None:
+            return p
+        return p.reshape(p.shape[0] * p.shape[1], W, H, -1)
+
+    def precompute_biases(self, p):
+        """Per-layer pair bias for the windowed atom-pair rep ``p`` (constant
+        across a diffusion rollout)."""
+        return self.diffusion_transformer.precompute_biases(self._window_p(p))
+
+    def __call__(self, q, c, p, to_keys=None, mask=None, multiplicity=1, biases=None):
         W = self.attn_window_queries
         H = self.attn_window_keys
         if W is not None:
@@ -174,7 +203,7 @@ class AtomTransformer(AbstractFromTorch):
 
         q = self.diffusion_transformer(
             a=q, s=c, z=p, mask=mask.astype(jnp.float32),
-            to_keys=to_keys_new, multiplicity=multiplicity,
+            to_keys=to_keys_new, multiplicity=multiplicity, biases=biases,
         )
         if W is not None:
             q = q.reshape(B, NW * W, D)
@@ -201,11 +230,20 @@ class AtomAttentionEncoder(AbstractFromTorch):
     atom_encoder: AtomTransformer
     atom_to_token_trans: Sequential
 
-    def __call__(self, feats, s_trunk=None, z=None, r=None, multiplicity=1,
-                 model_cache=None):
+    def precompute(self, feats, s_trunk=None, z=None):
+        """Coordinate-independent prefix of the encoder.
+
+        Everything here depends only on ref features + trunk outputs, not on the
+        diffusion coordinates ``r``, so the sampler runs it once per rollout.
+        Returns ``(q0, c, p, to_keys, atom_biases)`` where ``q0`` is the atom
+        embedding before the per-step ``r`` projection and ``atom_biases`` are
+        the inner atom-transformer's per-layer pair biases.
+        """
         B, N, _ = feats.ref_pos.shape
         atom_mask = feats.atom_pad_mask.astype(bool)
-        _, M = feats.restype.shape
+        # `restype.shape[1]` is the token count for both int [B, N] and soft
+        # [B, N, NTOKS] (mosaic design) restype.
+        M = feats.restype.shape[1]
 
         atom_ref_pos = feats.ref_pos
         atom_uid = feats.ref_space_uid
@@ -256,7 +294,7 @@ class AtomAttentionEncoder(AbstractFromTorch):
         else:
             p = None
 
-        q = c
+        q0 = c
 
         if self.structure_prediction:
             atom_to_token = (
@@ -279,15 +317,27 @@ class AtomAttentionEncoder(AbstractFromTorch):
             p = p + self.c_to_p_trans_q(c.reshape(B, K, W, 1, c.shape[-1]))
             p = p + self.c_to_p_trans_k(to_keys(c).reshape(B, K, 1, H, c.shape[-1]))
             p = p + self.p_mlp(p)
+            atom_biases = self.atom_encoder.precompute_biases(p)
+        else:
+            atom_biases = None
 
+        return q0, c, p, to_keys, atom_biases
+
+    def apply_coords(self, q0, c, p, to_keys, atom_biases, r, feats,
+                     multiplicity=1):
+        """Per-step part of the encoder: inject coordinates ``r`` and run the
+        atom transformer using the precomputed prefix."""
+        atom_mask = feats.atom_pad_mask.astype(bool)
+        M = feats.restype.shape[1]
+
+        q = q0
         if self.structure_prediction:
-            r_to_q = self.r_to_q_trans(r)
-            q = q + r_to_q
+            q = q + self.r_to_q_trans(r)
 
         if self.atom_encoder_depth > 0:
             q = self.atom_encoder(
                 q=q, mask=atom_mask, c=c, p=p, multiplicity=multiplicity,
-                to_keys=to_keys,
+                to_keys=to_keys, biases=atom_biases,
             )
 
         q_to_a = self.atom_to_token_trans(q)
@@ -301,6 +351,13 @@ class AtomAttentionEncoder(AbstractFromTorch):
         a = jnp.swapaxes(atom_to_token_mean, 1, 2) @ q_to_a
         return a, q, c, p, to_keys
 
+    def __call__(self, feats, s_trunk=None, z=None, r=None, multiplicity=1,
+                 model_cache=None):
+        q0, c, p, to_keys, atom_biases = self.precompute(feats, s_trunk, z)
+        return self.apply_coords(
+            q0, c, p, to_keys, atom_biases, r, feats, multiplicity
+        )
+
 
 # --- AtomAttentionDecoder ----------------------------------------------------
 @register_from_torch("promera.model.encoders.AtomAttentionDecoder")
@@ -309,7 +366,13 @@ class AtomAttentionDecoder(AbstractFromTorch):
     atom_decoder: AtomTransformer
     atom_feat_to_atom_pos_update: Sequential
 
-    def __call__(self, a, q, c, p, feats, to_keys, multiplicity=1, model_cache=None):
+    def precompute_biases(self, p):
+        """Per-layer pair biases for the decoder's atom transformer (constant
+        across a diffusion rollout — ``p`` is the cached atom-pair rep)."""
+        return self.atom_decoder.precompute_biases(p)
+
+    def __call__(self, a, q, c, p, feats, to_keys, multiplicity=1,
+                 model_cache=None, atom_biases=None):
         a_to_q = self.a_to_q_trans(a)
         atom_mask = feats.atom_pad_mask
         atom_to_token = (
@@ -319,7 +382,8 @@ class AtomAttentionDecoder(AbstractFromTorch):
         a_to_q = atom_to_token @ a_to_q
         q = q + a_to_q
         q = self.atom_decoder(
-            q=q, mask=atom_mask, c=c, p=p, multiplicity=multiplicity, to_keys=to_keys
+            q=q, mask=atom_mask, c=c, p=p, multiplicity=multiplicity,
+            to_keys=to_keys, biases=atom_biases,
         )
         return self.atom_feat_to_atom_pos_update(q)
 
@@ -347,7 +411,11 @@ class InputEmbedder(eqx.Module):
             a = jnp.where(feats.is_std[..., None], 0.0, a)
 
         is_epitope = feats.is_epitope.astype(jnp.float32)[..., None]
-        res_type = jax.nn.one_hot(res_type, _ntoks)
+        # `restype` is normally int token indices [B, N] (prediction). For
+        # gradient-based design (mosaic) it may instead arrive as a soft
+        # distribution [B, N, NTOKS]; pass that through so it stays
+        # differentiable. The integer path is unchanged.
+        res_type = res_type if res_type.ndim == 3 else jax.nn.one_hot(res_type, _ntoks)
         return jnp.concatenate([a, res_type, profile, deletion_mean, is_epitope],
                                axis=-1)
 
@@ -367,13 +435,25 @@ class MSALayer(AbstractFromTorch):
     outer_product_mean: OuterProductMean
 
     def __call__(self, z, m, token_mask, msa_mask, *, deterministic=True, key=None):
-        m = m + self.pair_weighted_averaging(m, z, token_mask)
+        # With ``deterministic`` (the default) every mask is all-ones and ``key``
+        # is unused, so the arithmetic is identical to the no-dropout path. When
+        # training, each masked residual draws its own key (PyTorch redraws the
+        # mask per call to ``get_dropout_mask``).
+        keys = (None,) * 5 if deterministic else jax.random.split(key, 5)
+        msa_dropout = get_dropout_mask(self.msa_dropout, m, not deterministic,
+                                       key=keys[0])
+        m = m + msa_dropout * self.pair_weighted_averaging(m, z, token_mask)
         m = m + self.msa_transition(m)
         z = z + self.outer_product_mean(m, msa_mask)
-        z = z + self.tri_mul_out(z, mask=token_mask)
-        z = z + self.tri_mul_in(z, mask=token_mask)
-        z = z + self.tri_att_start(z, mask=token_mask)
-        z = z + self.tri_att_end(z, mask=token_mask)
+        d = get_dropout_mask(self.z_dropout, z, not deterministic, key=keys[1])
+        z = z + d * self.tri_mul_out(z, mask=token_mask)
+        d = get_dropout_mask(self.z_dropout, z, not deterministic, key=keys[2])
+        z = z + d * self.tri_mul_in(z, mask=token_mask)
+        d = get_dropout_mask(self.z_dropout, z, not deterministic, key=keys[3])
+        z = z + d * self.tri_att_start(z, mask=token_mask)
+        d = get_dropout_mask(self.z_dropout, z, not deterministic, key=keys[4],
+                             columnwise=True)
+        z = z + d * self.tri_att_end(z, mask=token_mask)
         z = z + self.z_transition(z)
         return z, m
 
@@ -402,8 +482,15 @@ class MSAModule(eqx.Module):
             static=static,
         )
 
+    @property
+    def depth(self):
+        # leading axis of any stacked leaf == number of scanned layers
+        return tree.leaves(self.stacked_parameters)[0].shape[0]
+
     def __call__(self, z, emb, feats, *, deterministic=True, key=None):
-        msa = jax.nn.one_hot(feats.msa, _ntoks)
+        # int rows [B, S, N] (prediction) or a soft one-hot [B, S, N, NTOKS]
+        # (mosaic design, where MSA row 0 carries the soft binder sequence).
+        msa = feats.msa if feats.msa.ndim == 4 else jax.nn.one_hot(feats.msa, _ntoks)
         has_deletion = feats.has_deletion[..., None].astype(jnp.float32)
         deletion_value = feats.deletion_value[..., None]
         is_paired = feats.msa_paired[..., None].astype(jnp.float32)
@@ -419,14 +506,26 @@ class MSAModule(eqx.Module):
         m = self.msa_proj(m)
         m = m + self.s_proj(emb)[:, None]
 
+        # Per-layer keys (only used when not deterministic; the scan still
+        # carries them either way so the traced graph shape is constant).
+        layer_keys = (
+            jnp.zeros((self.depth, 2), dtype=jnp.uint32)
+            if deterministic
+            else jax.random.split(key, self.depth)
+        )
+
         @jax.checkpoint
-        def body_fn(carry, params):
+        def body_fn(carry, layer_inputs):
             z, m = carry
+            params, lkey = layer_inputs
             layer = eqx.combine(self.static, params)
-            z, m = layer(z, m, token_mask, msa_mask)
+            z, m = layer(z, m, token_mask, msa_mask,
+                         deterministic=deterministic, key=lkey)
             return (z, m), None
 
-        (z, m), _ = jax.lax.scan(body_fn, (z, m), self.stacked_parameters)
+        (z, m), _ = jax.lax.scan(
+            body_fn, (z, m), (self.stacked_parameters, layer_keys)
+        )
         s = (m * msa_mask[..., None]).sum(1) / (msa_mask.sum(1)[..., None] + 1e-5)
         return s, z
 
@@ -448,10 +547,18 @@ class PairformerLayer(AbstractFromTorch):
     transition_z: Transition
 
     def __call__(self, s, z, mask, pair_mask, *, deterministic=True, key=None):
-        z = z + self.tri_mul_out(z, mask=pair_mask)
-        z = z + self.tri_mul_in(z, mask=pair_mask)
-        z = z + self.tri_att_start(z, mask=pair_mask)
-        z = z + self.tri_att_end(z, mask=pair_mask)
+        # Dropout is on the pairwise (z) residuals only; the sequence (s)
+        # updates are never dropped (matches the PyTorch PairformerLayer).
+        keys = (None,) * 4 if deterministic else jax.random.split(key, 4)
+        d = get_dropout_mask(self.dropout, z, not deterministic, key=keys[0])
+        z = z + d * self.tri_mul_out(z, mask=pair_mask)
+        d = get_dropout_mask(self.dropout, z, not deterministic, key=keys[1])
+        z = z + d * self.tri_mul_in(z, mask=pair_mask)
+        d = get_dropout_mask(self.dropout, z, not deterministic, key=keys[2])
+        z = z + d * self.tri_att_start(z, mask=pair_mask)
+        d = get_dropout_mask(self.dropout, z, not deterministic, key=keys[3],
+                             columnwise=True)
+        z = z + d * self.tri_att_end(z, mask=pair_mask)
         z = z + self.transition_z(z)
         if not self.no_update_s:
             s = s + self.attention(s, z, mask)
@@ -474,15 +581,32 @@ class PairformerModule(eqx.Module):
         )
         return PairformerModule(stacked, static)
 
+    @property
+    def depth(self):
+        # leading axis of any stacked leaf == number of scanned layers
+        return tree.leaves(self.stacked_parameters)[0].shape[0]
+
     def __call__(self, s, z, mask, pair_mask, *, deterministic=True, key=None):
+        # Per-layer keys (unused when deterministic; carried regardless so the
+        # scan's traced shapes do not depend on the toggle).
+        layer_keys = (
+            jnp.zeros((self.depth, 2), dtype=jnp.uint32)
+            if deterministic
+            else jax.random.split(key, self.depth)
+        )
+
         @jax.checkpoint
-        def body_fn(carry, params):
+        def body_fn(carry, layer_inputs):
             s, z = carry
+            params, lkey = layer_inputs
             layer = eqx.combine(self.static, params)
-            s, z = layer(s, z, mask, pair_mask)
+            s, z = layer(s, z, mask, pair_mask,
+                         deterministic=deterministic, key=lkey)
             return (s, z), None
 
-        (s, z), _ = jax.lax.scan(body_fn, (s, z), self.stacked_parameters)
+        (s, z), _ = jax.lax.scan(
+            body_fn, (s, z), (self.stacked_parameters, layer_keys)
+        )
         return s, z
 
 
