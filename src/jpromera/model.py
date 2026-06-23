@@ -1,13 +1,16 @@
 """Top-level Promera model: input embedding, recycled trunk, distogram,
 diffusion sampling and confidence/contact heads.
 
-MSA subsampling (PyTorch ``subsample_msa_per_recycle``) is done inside the
-trunk: each recycle draws a fresh random ``subsample`` rows from the full MSA
-the caller passed in. This is JIT-clean because ``subsample`` is a static int,
-so the gathered/padded output depth is fixed at trace time; the per-recycle
-randomness comes from ``fold_in(key, i)`` on the loop index. The trunk
-therefore requires a PRNG ``key`` — pass a fixed one (e.g. ``key(0)``) for
-deterministic/parity runs.
+MSA subsampling (cf. PyTorch ``subsample_msa_per_recycle``) is done inside the
+trunk: each recycle pins row 0 (the query) and draws a fresh random
+``subsample - 1`` of the remaining rows from the full MSA the caller passed in.
+This is JIT-clean because ``subsample`` is a static int, so the gathered/padded
+output depth is fixed at trace time; the per-recycle randomness comes from
+``fold_in(key, i)`` on the loop index. The trunk therefore requires a PRNG
+``key`` — pass a fixed one (e.g. ``key(0)``) for deterministic runs.
+
+Pinning row 0 is a deliberate divergence from PyTorch, which samples it
+uniformly; see ``_subsample_msa``.
 """
 
 
@@ -220,20 +223,31 @@ class JPromera(eqx.Module):
         return final, traj, noisy
 
 
-# --- MSA subsampling (PyTorch PromeraModel.subsample_msa) ---
+# --- MSA subsampling (cf. PyTorch PromeraModel.subsample_msa) ---
 _MSA_FIELDS = ("msa", "msa_mask", "msa_paired", "has_deletion", "deletion_value")
 
 
 def _subsample_msa(feats, key, subsample: int):
-    """Draw ``subsample`` MSA rows without replacement and pad back to that
-    depth, matching PyTorch's ``subsample_msa`` (np.random.choice + F.pad).
+    """Pin MSA row 0 (the query) and draw the remaining rows without
+    replacement, then pad back to ``subsample`` depth.
+
+    This DIVERGES from PyTorch's ``subsample_msa`` (np.random.choice over all
+    rows + F.pad), which samples row 0 uniformly and so can drop the query.
+    Row 0 is the paired query row — and, for binder design, the only real MSA
+    row a depth-1 designed chain has — so we always keep it and place it first;
+    the other ``k - 1`` rows are sampled from rows ``1..S-1``.
 
     ``subsample`` is a static int and the source depth ``S`` is a static array
     dim, so ``k`` and the pad amount are known at trace time — JIT-clean. The
     gather index is traced (it depends on ``key``)."""
     S = feats.msa.shape[1]              # static
     k = min(S, subsample)               # static
-    idx = jax.random.choice(key, S, (k,), replace=False)
+    if k <= 1:
+        # Only room for (or only) the query row — nothing left to sample.
+        idx = jnp.arange(k)
+    else:
+        rest = jax.random.choice(key, jnp.arange(1, S), (k - 1,), replace=False)
+        idx = jnp.concatenate([jnp.array([0]), rest])
 
     def take(x):
         x = x[:, idx]                   # gather rows (handles int or one-hot MSA)
