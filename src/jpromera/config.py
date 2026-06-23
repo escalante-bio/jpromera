@@ -196,3 +196,7 @@ DIFFUSION = {
 # Token vocabulary size (tinyprot.feature._ntoks); fixed so core stays
 # torch/tinyprot-free.
 NTOKS = 34
+
+# MSA subsampling: per recycle, the trunk draws this many MSA rows (matches
+# PyTorch ``msas_per_trunk_iter`` with ``subsample_msa_per_recycle``).
+MSAS_PER_TRUNK_ITER = CONFIG["model"]["msas_per_trunk_iter"]

@@ -1,18 +1,27 @@
 """Top-level Promera model: input embedding, recycled trunk, distogram,
 diffusion sampling and confidence/contact heads.
 
-MSA subsampling (PyTorch ``subsample_msa_per_recycle``) is a data-prep concern
-and is NOT done inside this model: the caller provides ``feats`` with whatever
-MSA depth should be used. This keeps the trunk a pure function of its inputs
-(important for JIT and for gradient-based use in mosaic).
+MSA subsampling (cf. PyTorch ``subsample_msa_per_recycle``) is done inside the
+trunk: each recycle pins row 0 (the query) and draws a fresh random
+``subsample - 1`` of the remaining rows from the full MSA the caller passed in.
+This is JIT-clean because ``subsample`` is a static int, so the gathered/padded
+output depth is fixed at trace time; the per-recycle randomness comes from
+``fold_in(key, i)`` on the loop index. The trunk therefore requires a PRNG
+``key`` — pass a fixed one (e.g. ``key(0)``) for deterministic runs.
+
+Pinning row 0 is a deliberate divergence from PyTorch, which samples it
+uniformly; see ``_subsample_msa``.
 """
 
 
 from __future__ import annotations
+import dataclasses
 import equinox as eqx
 import jax
 from jax import numpy as jnp
 from jaxtyping import Array, Float
+
+from .config import MSAS_PER_TRUNK_ITER
 
 
 from .backend import Embedding, LayerNorm, Linear, from_torch, register_from_torch
@@ -60,6 +69,10 @@ class JPromera(eqx.Module):
     structure_module: AtomDiffusion
     sm_confidence_module: ConfidenceModule
     contact_module: ContactModule
+    # Enables trunk dropout (MSA + Pairformer), gated like PyTorch's ``training``
+    # flag. Static so it never affects JIT randomness when off. Default False ->
+    # behaviour is bit-identical to the deterministic eval path used for parity.
+    dropout: bool = eqx.field(static=True, default=False)
 
     @staticmethod
     def from_torch(m: _model.PromeraModel):
@@ -107,19 +120,38 @@ class JPromera(eqx.Module):
                                 relpos=relpos)
 
     # -- one trunk recycling iteration --
-    def trunk_iteration(self, state: TrunkState, emb: InitialEmbedding, feats):
+    def trunk_iteration(self, state: TrunkState, emb: InitialEmbedding, feats,
+                        key=None):
         mask = feats.token_pad_mask.astype(jnp.float32)
         pair_mask = mask[:, :, None] * mask[:, None, :]
         s = emb.s_init + self.s_recycle(self.s_norm(state.s))
         z = emb.z_init + self.z_recycle(self.z_norm(state.z))
-        _, z_msa = self.msa_module(z, emb.s_inputs, feats)
+        # When dropout is off the modules run their deterministic (all-ones mask)
+        # path and ignore the key entirely — identical to the pre-key behaviour.
+        det = not self.dropout
+        k_msa, k_pf = (None, None) if det else jax.random.split(key, 2)
+        _, z_msa = self.msa_module(z, emb.s_inputs, feats,
+                                   deterministic=det, key=k_msa)
         z = z + z_msa
-        s, z = self.pairformer_module(s, z, mask=mask, pair_mask=pair_mask)
+        s, z = self.pairformer_module(s, z, mask=mask, pair_mask=pair_mask,
+                                      deterministic=det, key=k_pf)
         return TrunkState(s=s, z=z)
 
-    def trunk(self, feats, recycling_steps: int):
+    def trunk(self, feats, recycling_steps: int, key, *, subsample=MSAS_PER_TRUNK_ITER):
         emb = self.embed_inputs(feats)
         state = TrunkState(s=jnp.zeros_like(emb.s_init), z=jnp.zeros_like(emb.z_init))
+
+        # Per-recycle MSA feats: a fresh random subset of ``subsample`` rows.
+        # ``i`` is the (possibly traced) recycle index, so ``fold_in`` gives each
+        # recycle an independent draw (PyTorch subsample_msa_per_recycle).
+        def feats_for(i):
+            return _subsample_msa(feats, jax.random.fold_in(key, i), subsample)
+
+        # Dropout draws from a separate per-recycle key (only consumed when
+        # ``self.dropout`` is on), so the MSA-subsample randomness above is byte
+        # for byte unchanged whether or not dropout is enabled.
+        def dropout_key(i):
+            return jax.random.fold_in(jax.random.fold_in(key, 0xD0), i)
 
         # Run the first (recycling_steps - 1) iterations with NO gradient (each
         # output detached, so no backward graph / activations are retained), then
@@ -127,19 +159,29 @@ class JPromera(eqx.Module):
         # last recycle (matching PyTorch's set_grad_enabled(i == last)) and keeps
         # backprop memory bounded — forward values are unchanged.
         def no_grad_iter(i, st):
-            return jax.lax.stop_gradient(self.trunk_iteration(st, emb, feats))
+            return jax.lax.stop_gradient(
+                self.trunk_iteration(st, emb, feats_for(i), dropout_key(i))
+            )
 
         state = jax.lax.fori_loop(0, recycling_steps - 1, no_grad_iter, state)
         state = jax.lax.stop_gradient(state)
-        state = self.trunk_iteration(state, emb, feats)  # final, differentiated
+        # final, differentiated iteration (recycle index recycling_steps - 1)
+        last = recycling_steps - 1
+        state = self.trunk_iteration(state, emb, feats_for(last), dropout_key(last))
 
         pdistogram = self.distogram_module(state.z)
         return emb, state, pdistogram
 
     @eqx.filter_jit
-    def fold(self, feats, recycling_steps: int) -> TrunkOutput:
-        """Run the trunk + distogram. Returns the conditioning for sampling."""
-        emb, state, pdistogram = self.trunk(feats, recycling_steps)
+    def fold(self, feats, recycling_steps: int, key,
+             *, subsample=MSAS_PER_TRUNK_ITER) -> TrunkOutput:
+        """Run the trunk + distogram. Returns the conditioning for sampling.
+
+        ``key`` seeds the per-recycle MSA subsampling (``subsample`` rows each
+        recycle); pass a fixed key for deterministic runs.
+        """
+        emb, state, pdistogram = self.trunk(feats, recycling_steps, key,
+                                            subsample=subsample)
         return TrunkOutput(
             s=state.s, z=state.z, s_inputs=emb.s_inputs, s_init=emb.s_init,
             z_init=emb.z_init, relpos=emb.relpos, pdistogram=pdistogram,
@@ -160,9 +202,16 @@ class JPromera(eqx.Module):
         tr = jax.random.normal(k_aug, (num_steps, B, 1, 3))
         churn = jax.random.normal(k_churn, (num_steps, B, M, 3))
 
+        # Hoist the coordinate-independent conditioning (pair bias, atom-encoder
+        # prefix, per-layer pair biases) out of the per-step scan — computed once.
+        cache = self.structure_module.score_model.precompute_conditioning(
+            s_trunk=out.s, z_trunk=out.z,
+            relative_position_encoding=out.relpos, feats=feats,
+        )
         conditioning = dict(
             s_inputs=out.s_inputs, s_trunk=out.s, z_trunk=out.z,
             relative_position_encoding=out.relpos, feats=feats, multiplicity=1,
+            cache=cache,
         )
         final, traj, noisy = edm_sample(
             self.structure_module, conditioning, atom_mask, init,
@@ -172,6 +221,43 @@ class JPromera(eqx.Module):
             noise_scale=diffusion_cfg["noise_scale"],
         )
         return final, traj, noisy
+
+
+# --- MSA subsampling (cf. PyTorch PromeraModel.subsample_msa) ---
+_MSA_FIELDS = ("msa", "msa_mask", "msa_paired", "has_deletion", "deletion_value")
+
+
+def _subsample_msa(feats, key, subsample: int):
+    """Pin MSA row 0 (the query) and draw the remaining rows without
+    replacement, then pad back to ``subsample`` depth.
+
+    This DIVERGES from PyTorch's ``subsample_msa`` (np.random.choice over all
+    rows + F.pad), which samples row 0 uniformly and so can drop the query.
+    Row 0 is the paired query row — and, for binder design, the only real MSA
+    row a depth-1 designed chain has — so we always keep it and place it first;
+    the other ``k - 1`` rows are sampled from rows ``1..S-1``.
+
+    ``subsample`` is a static int and the source depth ``S`` is a static array
+    dim, so ``k`` and the pad amount are known at trace time — JIT-clean. The
+    gather index is traced (it depends on ``key``)."""
+    S = feats.msa.shape[1]              # static
+    k = min(S, subsample)               # static
+    if k <= 1:
+        # Only room for (or only) the query row — nothing left to sample.
+        idx = jnp.arange(k)
+    else:
+        rest = jax.random.choice(key, jnp.arange(1, S), (k - 1,), replace=False)
+        idx = jnp.concatenate([jnp.array([0]), rest])
+
+    def take(x):
+        x = x[:, idx]                   # gather rows (handles int or one-hot MSA)
+        if k < subsample:
+            pad = [(0, 0)] * x.ndim
+            pad[1] = (0, subsample - k)
+            x = jnp.pad(x, pad)
+        return x
+
+    return dataclasses.replace(feats, **{f: take(getattr(feats, f)) for f in _MSA_FIELDS})
 
 
 # --- random rotations (matches torch3d quaternion sampling used by promera) ---

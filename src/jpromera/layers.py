@@ -9,7 +9,6 @@ as ``chunk_size`` that are no-ops in JAX).
 from __future__ import annotations
 import einops
 import jax
-import numpy as np
 from jax import numpy as jnp
 from jaxtyping import Array, Bool, Float
 
@@ -19,7 +18,6 @@ from .backend import (
     LayerNorm,
     Linear,
     Sequential,
-    from_torch,
     register_from_torch,
 )
 
@@ -256,6 +254,7 @@ class AttentionPairBias(AbstractFromTorch):
         multiplicity: int = 1,
         to_keys=None,
         model_cache=None,
+        bias=None,
     ):
         B = s.shape[0]
         if self.initial_norm:
@@ -271,7 +270,11 @@ class AttentionPairBias(AbstractFromTorch):
         k = self.proj_k(k_in).reshape(B, -1, self.num_heads, self.head_dim)
         v = self.proj_v(k_in).reshape(B, -1, self.num_heads, self.head_dim)
 
-        bias = self.proj_z(z)  # (B, num_heads, N, N)
+        # ``bias`` (= proj_z(z), shape (B, num_heads, N, N)) is constant across a
+        # diffusion rollout, so the sampler precomputes it once; recompute only
+        # on the cache-free path.
+        if bias is None:
+            bias = self.proj_z(z)
         g = jax.nn.sigmoid(self.proj_g(s))
 
         o = jax.nn.dot_product_attention(
