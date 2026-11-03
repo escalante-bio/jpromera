@@ -137,37 +137,38 @@ class JPromera(eqx.Module):
                                       deterministic=det, key=k_pf)
         return TrunkState(s=s, z=z)
 
+    def init_state(self, emb: InitialEmbedding) -> TrunkState:
+        """The recycled state before the first trunk pass (zeros)."""
+        return TrunkState(s=jnp.zeros_like(emb.s_init), z=jnp.zeros_like(emb.z_init))
+
+    def step(self, feats, emb: InitialEmbedding, state: TrunkState, *, key,
+             subsample=MSAS_PER_TRUNK_ITER) -> TrunkState:
+        """Exactly one trunk pass on a fresh random subset of ``subsample`` MSA rows
+        (row 0, the query, pinned; drawn with ``key``). Dropout, when enabled,
+        draws from ``fold_in(key, 0xD0)``, so the MSA rows are the same with or
+        without it. Differentiates through ``state``; `trunk` detaches it."""
+        return self.trunk_iteration(
+            state, emb, _subsample_msa(feats, key, subsample), jax.random.fold_in(key, 0xD0)
+        )
+
     def trunk(self, feats, recycling_steps: int, key, *, subsample=MSAS_PER_TRUNK_ITER):
+        """``recycling_steps`` passes of `step` from `init_state`, pass ``i`` with
+        ``fold_in(key, i)``."""
         emb = self.embed_inputs(feats)
-        state = TrunkState(s=jnp.zeros_like(emb.s_init), z=jnp.zeros_like(emb.z_init))
+        state = self.init_state(emb)
 
-        # Per-recycle MSA feats: a fresh random subset of ``subsample`` rows.
-        # ``i`` is the (possibly traced) recycle index, so ``fold_in`` gives each
-        # recycle an independent draw (PyTorch subsample_msa_per_recycle).
-        def feats_for(i):
-            return _subsample_msa(feats, jax.random.fold_in(key, i), subsample)
-
-        # Dropout draws from a separate per-recycle key (only consumed when
-        # ``self.dropout`` is on), so the MSA-subsample randomness above is byte
-        # for byte unchanged whether or not dropout is enabled.
-        def dropout_key(i):
-            return jax.random.fold_in(jax.random.fold_in(key, 0xD0), i)
+        def step(i, st):
+            return self.step(feats, emb, st, key=jax.random.fold_in(key, i), subsample=subsample)
 
         # Run the first (recycling_steps - 1) iterations with NO gradient (each
         # output detached, so no backward graph / activations are retained), then
         # one final differentiated iteration. This isolates the gradient to the
         # last recycle (matching PyTorch's set_grad_enabled(i == last)) and keeps
         # backprop memory bounded — forward values are unchanged.
-        def no_grad_iter(i, st):
-            return jax.lax.stop_gradient(
-                self.trunk_iteration(st, emb, feats_for(i), dropout_key(i))
-            )
-
-        state = jax.lax.fori_loop(0, recycling_steps - 1, no_grad_iter, state)
-        state = jax.lax.stop_gradient(state)
-        # final, differentiated iteration (recycle index recycling_steps - 1)
-        last = recycling_steps - 1
-        state = self.trunk_iteration(state, emb, feats_for(last), dropout_key(last))
+        state = jax.lax.fori_loop(
+            0, recycling_steps - 1, lambda i, st: jax.lax.stop_gradient(step(i, st)), state
+        )
+        state = step(recycling_steps - 1, jax.lax.stop_gradient(state))
 
         pdistogram = self.distogram_module(state.z)
         return emb, state, pdistogram
